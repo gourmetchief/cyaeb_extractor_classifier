@@ -41,7 +41,7 @@ services:
     pull_policy: never
     container_name: mirror-cockpit-app
     restart: unless-stopped
-    command: ["/usr/local/bin/uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["/usr/local/bin/uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8099"]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
