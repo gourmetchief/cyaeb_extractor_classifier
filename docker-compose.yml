@@ -14,7 +14,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "${WEBUI_PORT:-8094}:8000"
+      - "${WEBUI_PORT:-8094}:8096"
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
