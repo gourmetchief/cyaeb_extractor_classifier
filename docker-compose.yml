@@ -14,7 +14,7 @@ services:
     devices:
       - /dev/net/tun:/dev/net/tun
     ports:
-      - "${WEBUI_PORT:-8094}:8096"
+      - "${WEBUI_PORT:-8094}:8001"
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
@@ -37,11 +37,25 @@ services:
     build:
       context: .
     image: website-mirror-cockpit:latest
-    # --- FIX: Prevents Portainer from trying to pull the local image ---
     pull_policy: never
     container_name: mirror-cockpit-app
     restart: unless-stopped
-    command: ["/usr/local/bin/uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8099"]
+    # --- This command is critical for running the robust server ---
+    command:
+      - /usr/local/bin/gunicorn
+      - -w
+      - "2"
+      - -k
+      - uvicorn.workers.UvicornWorker
+      - app.server:app
+      - --bind
+      - 0.0.0.0:8001
+      - --log-level
+      - info
+      - --access-logfile
+      - "-"
+      - --error-logfile
+      - "-"
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
@@ -49,6 +63,13 @@ services:
     volumes:
       - mirror_data:/data/output
       - app_state:/data
+    # --- This healthcheck ensures the app is actually working ---
+    healthcheck:
+      test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
 
 # -----------------------------------------------------------------
 # Define the volumes used by the services
