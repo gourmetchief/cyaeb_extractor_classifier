@@ -4,9 +4,7 @@ FROM python:3.12-slim
 # --- Install system dependencies ---
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
 
-# --- Create a non-root user for security ---
-RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
-
+# --- Environment variables ---
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -31,7 +29,7 @@ pip install --no-cache-dir -r /app/requirements.txt
 EOF
 
 # ---- App code (Combined Server, VPN Checker, and Process Manager) ----
-RUN mkdir -p /app/app /app/templates \
+RUN mkdir -p /app/app /app/templates /data/input /data/output /data/logs \
  && touch /app/app/__init__.py
 
 # --- Create the server.py file in a single, atomic RUN command ---
@@ -142,7 +140,8 @@ async def run_mirror_process():
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
-@app.get("/health", status_code=200)
+# --- FIX: Healthcheck now accepts GET and HEAD requests ---
+@app.api_route("/health", methods=["GET", "HEAD"], status_code=200)
 async def health_check():
     return {"status": "ok"}
 
@@ -430,10 +429,4 @@ cat > /app/templates/index.html <<'HTMLCODE'
 HTMLCODE
 HTML
 
-# --- FIX: Create data directories and set permissions BEFORE switching user ---
-# This ensures the non-root user can write to the volume.
-RUN mkdir -p /data/input /data/output /data/logs \
- && chown -R appuser:appuser /app /data
-
-# --- Switch to the non-root user ---
-USER appuser
+# NOTE: The non-root user setup has been removed. The container now runs as root.
