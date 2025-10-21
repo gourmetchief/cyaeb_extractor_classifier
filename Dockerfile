@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # --- Install system dependencies ---
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
 
-# --- FIX: Create a non-root user for security ---
+# --- Create a non-root user for security ---
 RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -30,11 +30,11 @@ REQS
 pip install --no-cache-dir -r /app/requirements.txt
 EOF
 
-# ---- App code (Combined Server, VPN Checker, and Process Manager) ----
+# ---- Create application directories ----
 RUN mkdir -p /app/app /app/templates /data/input /data/output /data/logs \
  && touch /app/app/__init__.py
 
-# ---------- server.py (The new all-in-one cockpit application) ----------
+# --- FIX: Create the entire server.py file in a single, atomic RUN command ---
 RUN <<'PY' bash
 cat > /app/app/server.py <<'PYCODE'
 import asyncio
@@ -52,7 +52,7 @@ from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import aiofiles
 
-# --- FIX: Set up proper logging for better debugging ---
+# --- Set up proper logging for better debugging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
@@ -133,7 +133,125 @@ async def run_mirror_process():
             process.terminate()
             await process.wait()
 
-# --- HTML Template (unchanged, but placed in its own file creation step) ---
+# --- API Endpoints ---
+@app.get("/", response_class=HTMLResponse)
+async def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
+
+@app.get("/health", status_code=200)
+async def health_check():
+    return {"status": "ok"}
+
+@app.get("/status", response_class=JSONResponse)
+async def get_status_endpoint():
+    return get_status()
+
+@app.get("/csv-status", response_class=JSONResponse)
+async def get_csv_status():
+    return {"message": f"'{URLS_CSV_PATH.name}' is ready."} if URLS_CSV_PATH.exists() else {"message": "No CSV uploaded yet."}
+
+@app.get("/vpn-status", response_class=JSONResponse)
+async def get_vpn_status():
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get("https://ipinfo.io/json", timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            return {
+                "status": "Connected",
+                "ip": data.get("ip"),
+                "location": f"{data.get('city', '')}, {data.get('country', '')}"
+            }
+    except Exception as e:
+        log.warning(f"VPN status check failed: {e}")
+        return {"status": "Disconnected", "ip": "Error", "location": str(e)}
+
+@app.post("/start")
+async def start_mirroring():
+    log.info("Received request to start mirroring.")
+    async with mirror_lock:
+        if get_status()['status'] == 'mirroring':
+            log.warning("Attempted to start mirroring process while one is already running.")
+            raise HTTPException(409, "Mirroring process is already running.")
+        asyncio.create_task(run_mirror_process())
+    return RedirectResponse(url="/", status_code=303)
+
+@app.post("/stop")
+async def stop_mirroring():
+    log.info("Received request to stop mirroring.")
+    status = get_status()
+    pid = status.get('pid')
+    if status.get('status') != 'mirroring' or not pid:
+        log.warning("Attempted to stop mirroring process but none was running.")
+        raise HTTPException(404, "No mirroring process is running.")
+    try:
+        os.kill(pid, 15) # SIGTERM
+        log.info(f"Sent SIGTERM to process {pid}")
+        set_status("idle")
+    except ProcessLookupError:
+        log.warning(f"Process {pid} not found, it may have already finished.")
+        set_status("idle")
+    return RedirectResponse(url="/", status_code=303)
+
+@app.post("/upload")
+async def upload_csv(file: UploadFile = File(...)):
+    if not file.filename.endswith('.csv'):
+        raise HTTPException(400, "Invalid file type. Please upload a .csv file.")
+    try:
+        async with aiofiles.open(URLS_CSV_PATH, "wb") as buffer:
+            content = await file.read()
+            await buffer.write(content)
+        log.info(f"Successfully uploaded '{file.filename}' to {URLS_CSV_PATH}")
+    except Exception as e:
+        log.error(f"Failed to write uploaded file: {e}", exc_info=True)
+        raise HTTPException(500, "Could not save uploaded file.")
+    return RedirectResponse(url="/", status_code=303)
+
+@app.get("/sites-list", response_class=JSONResponse)
+async def get_sites_list():
+    sites_info = []
+    if OUTPUT_DIR.exists():
+        for site_dir in sorted(OUTPUT_DIR.iterdir()):
+            if site_dir.is_dir():
+                index_path = next(site_dir.rglob("index.html"), None) or next(site_dir.rglob("*.html"), None)
+                if index_path:
+                    sites_info.append({"name": site_dir.name, "index_path": str(index_path.relative_to(site_dir))})
+    return sites_info
+
+@app.get("/download/{site_name}")
+def download_zip(site_name: str):
+    site_path = (OUTPUT_DIR / site_name).resolve()
+    if not site_path.is_dir() or OUTPUT_DIR.resolve() not in site_path.parents:
+        raise HTTPException(404, "Site not found or access denied")
+    
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for file in site_path.rglob("*"):
+            zf.write(file, file.relative_to(site_path))
+    zip_buffer.seek(0)
+    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename={site_name}.zip"})
+
+@app.websocket("/ws/status")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    log.info("WebSocket client connected.")
+    last_pos = 0
+    try:
+        while True:
+            await websocket.send_json({"type": "status", "payload": get_status()})
+            if LOG_FILE_PATH.exists():
+                async with aiofiles.open(LOG_FILE_PATH, 'r') as f:
+                    await f.seek(last_pos)
+                    if new_lines := await f.read():
+                        await websocket.send_json({"type": "log", "payload": new_lines})
+                        last_pos = await f.tell()
+            await asyncio.sleep(2)
+    except Exception:
+        log.info("WebSocket client disconnected.")
+PYCODE
+PY
+
+# --- FIX: Create the HTML template file in a separate, atomic RUN command ---
 RUN <<'HTML' bash
 cat > /app/templates/index.html <<'HTMLCODE'
 <!DOCTYPE html>
@@ -308,129 +426,6 @@ cat > /app/templates/index.html <<'HTMLCODE'
 HTMLCODE
 HTML
 
-# ---------- server.py continued... ----------
-RUN <<'PY' bash
-cat >> /app/app/server.py <<'PYCODE'
-
-# --- API Endpoints ---
-@app.get("/", response_class=HTMLResponse)
-async def index(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-# --- FIX: Added a healthcheck endpoint for Docker ---
-@app.get("/health", status_code=200)
-async def health_check():
-    return {"status": "ok"}
-
-@app.get("/status", response_class=JSONResponse)
-async def get_status_endpoint():
-    return get_status()
-
-@app.get("/csv-status", response_class=JSONResponse)
-async def get_csv_status():
-    return {"message": f"'{URLS_CSV_PATH.name}' is ready."} if URLS_CSV_PATH.exists() else {"message": "No CSV uploaded yet."}
-
-@app.get("/vpn-status", response_class=JSONResponse)
-async def get_vpn_status():
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.get("https://ipinfo.io/json", timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            return {
-                "status": "Connected",
-                "ip": data.get("ip"),
-                "location": f"{data.get('city', '')}, {data.get('country', '')}"
-            }
-    except Exception as e:
-        log.warning(f"VPN status check failed: {e}")
-        return {"status": "Disconnected", "ip": "Error", "location": str(e)}
-
-@app.post("/start")
-async def start_mirroring():
-    log.info("Received request to start mirroring.")
-    async with mirror_lock:
-        if get_status()['status'] == 'mirroring':
-            log.warning("Attempted to start mirroring process while one is already running.")
-            raise HTTPException(409, "Mirroring process is already running.")
-        asyncio.create_task(run_mirror_process())
-    return RedirectResponse(url="/", status_code=303)
-
-@app.post("/stop")
-async def stop_mirroring():
-    log.info("Received request to stop mirroring.")
-    status = get_status()
-    pid = status.get('pid')
-    if status.get('status') != 'mirroring' or not pid:
-        log.warning("Attempted to stop mirroring process but none was running.")
-        raise HTTPException(404, "No mirroring process is running.")
-    try:
-        os.kill(pid, 15) # SIGTERM
-        log.info(f"Sent SIGTERM to process {pid}")
-        set_status("idle")
-    except ProcessLookupError:
-        log.warning(f"Process {pid} not found, it may have already finished.")
-        set_status("idle")
-    return RedirectResponse(url="/", status_code=303)
-
-@app.post("/upload")
-async def upload_csv(file: UploadFile = File(...)):
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(400, "Invalid file type. Please upload a .csv file.")
-    try:
-        async with aiofiles.open(URLS_CSV_PATH, "wb") as buffer:
-            content = await file.read()
-            await buffer.write(content)
-        log.info(f"Successfully uploaded '{file.filename}' to {URLS_CSV_PATH}")
-    except Exception as e:
-        log.error(f"Failed to write uploaded file: {e}", exc_info=True)
-        raise HTTPException(500, "Could not save uploaded file.")
-    return RedirectResponse(url="/", status_code=303)
-
-@app.get("/sites-list", response_class=JSONResponse)
-async def get_sites_list():
-    sites_info = []
-    if OUTPUT_DIR.exists():
-        for site_dir in sorted(OUTPUT_DIR.iterdir()):
-            if site_dir.is_dir():
-                index_path = next(site_dir.rglob("index.html"), None) or next(site_dir.rglob("*.html"), None)
-                if index_path:
-                    sites_info.append({"name": site_dir.name, "index_path": str(index_path.relative_to(site_dir))})
-    return sites_info
-
-@app.get("/download/{site_name}")
-def download_zip(site_name: str):
-    site_path = (OUTPUT_DIR / site_name).resolve()
-    if not site_path.is_dir() or OUTPUT_DIR.resolve() not in site_path.parents:
-        raise HTTPException(404, "Site not found or access denied")
-    
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file in site_path.rglob("*"):
-            zf.write(file, file.relative_to(site_path))
-    zip_buffer.seek(0)
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename={site_name}.zip"})
-
-@app.websocket("/ws/status")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    log.info("WebSocket client connected.")
-    last_pos = 0
-    try:
-        while True:
-            await websocket.send_json({"type": "status", "payload": get_status()})
-            if LOG_FILE_PATH.exists():
-                async with aiofiles.open(LOG_FILE_PATH, 'r') as f:
-                    await f.seek(last_pos)
-                    if new_lines := await f.read():
-                        await websocket.send_json({"type": "log", "payload": new_lines})
-                        last_pos = await f.tell()
-            await asyncio.sleep(2)
-    except Exception:
-        log.info("WebSocket client disconnected.")
-PYCODE
-PY
-
-# --- FIX: Set correct permissions and switch to non-root user ---
+# --- Set correct permissions and switch to non-root user ---
 RUN chown -R appuser:appuser /app /data
 USER appuser
