@@ -14,6 +14,10 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
+    # --- FIX: Moved the port mapping here from the mirror-cockpit service ---
+    # This allows you to access the web UI through the VPN container's network.
+    ports:
+      - "${WEBUI_PORT:-8094}:8000"
     environment:
       - VPN_SERVICE_PROVIDER=nordvpn
       - VPN_TYPE=openvpn
@@ -51,9 +55,7 @@ services:
       - mirror_data:/data/output
       # Use a named volume for logs, status, and the uploaded CSV
       - app_state:/data
-    ports:
-      # The web UI is accessed on your host machine
-      - "${WEBUI_PORT:-8094}:8000"
+    # --- FIX: Removed the conflicting 'ports' section from this service ---
 
 # -----------------------------------------------------------------
 # Define the volumes used by the services
