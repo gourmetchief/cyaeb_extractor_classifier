@@ -1,9 +1,6 @@
 version: '3.8'
 
 services:
-  # -----------------------------------------------------------------
-  # Service 1: Gluetun VPN Client 🚀
-  # -----------------------------------------------------------------
   gluetun:
     image: qmcgaw/gluetun:latest
     container_name: mirror-cockpit-vpn
@@ -30,9 +27,6 @@ services:
       retries: 10
       start_period: 90s
 
-  # -----------------------------------------------------------------
-  # Service 2: The Website Mirror Cockpit 🖥️
-  # -----------------------------------------------------------------
   mirror-cockpit:
     build:
       context: .
@@ -40,7 +34,6 @@ services:
     pull_policy: never
     container_name: mirror-cockpit-app
     restart: unless-stopped
-    # --- This command is critical for running the robust server ---
     command:
       - /usr/local/bin/gunicorn
       - -w
@@ -63,7 +56,6 @@ services:
     volumes:
       - mirror_data:/data/output
       - app_state:/data
-    # --- This healthcheck ensures the app is actually working ---
     healthcheck:
       test: ["CMD-SHELL", "wget --quiet --tries=1 --spider http://localhost:8001/health || exit 1"]
       interval: 30s
@@ -71,9 +63,6 @@ services:
       retries: 5
       start_period: 30s
 
-# -----------------------------------------------------------------
-# Define the volumes used by the services
-# -----------------------------------------------------------------
 volumes:
   mirror_data:
   app_state:
