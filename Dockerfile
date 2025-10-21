@@ -30,11 +30,11 @@ REQS
 pip install --no-cache-dir -r /app/requirements.txt
 EOF
 
-# ---- Create application directories ----
-RUN mkdir -p /app/app /app/templates /data/input /data/output /data/logs \
+# ---- App code (Combined Server, VPN Checker, and Process Manager) ----
+RUN mkdir -p /app/app /app/templates \
  && touch /app/app/__init__.py
 
-# --- FIX: Create the entire server.py file in a single, atomic RUN command ---
+# --- Create the server.py file in a single, atomic RUN command ---
 RUN <<'PY' bash
 cat > /app/app/server.py <<'PYCODE'
 import asyncio
@@ -79,7 +79,11 @@ def get_status():
 
 def set_status(status, pid=None):
     log.info(f"Updating status to: {status}, PID: {pid}")
-    STATUS_FILE_PATH.write_text(json.dumps({"status": status, "pid": pid}))
+    try:
+        STATUS_FILE_PATH.write_text(json.dumps({"status": status, "pid": pid}))
+    except Exception as e:
+        log.error(f"!!! FAILED to write status file at {STATUS_FILE_PATH}: {e}")
+
 
 # --- App Lifespan ---
 @asynccontextmanager
@@ -251,7 +255,7 @@ async def websocket_endpoint(websocket: WebSocket):
 PYCODE
 PY
 
-# --- FIX: Create the HTML template file in a separate, atomic RUN command ---
+# --- Create the HTML template file in a separate, atomic RUN command ---
 RUN <<'HTML' bash
 cat > /app/templates/index.html <<'HTMLCODE'
 <!DOCTYPE html>
@@ -426,6 +430,10 @@ cat > /app/templates/index.html <<'HTMLCODE'
 HTMLCODE
 HTML
 
-# --- Set correct permissions and switch to non-root user ---
-RUN chown -R appuser:appuser /app /data
+# --- FIX: Create data directories and set permissions BEFORE switching user ---
+# This ensures the non-root user can write to the volume.
+RUN mkdir -p /data/input /data/output /data/logs \
+ && chown -R appuser:appuser /app /data
+
+# --- Switch to the non-root user ---
 USER appuser
