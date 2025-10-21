@@ -54,6 +54,7 @@ LOG_DIR = DATA_DIR / "logs"
 URLS_CSV_PATH = INPUT_DIR / "urls.csv"
 LOG_FILE_PATH = LOG_DIR / "mirror.log"
 STATUS_FILE_PATH = DATA_DIR / "status.json"
+TEMPLATES_DIR = Path("/app/templates")
 
 # --- Global State ---
 def get_status():
@@ -79,7 +80,7 @@ async def lifespan(app: FastAPI):
 
 # --- FastAPI App Initialization ---
 app = FastAPI(title="Website Mirror Cockpit", lifespan=lifespan)
-templates = Jinja2Templates(directory=str(Path("/app/templates")))
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 app.mount("/sites", StaticFiles(directory=OUTPUT_DIR), name="sites")
 
 # --- Background Mirroring Task ---
@@ -264,7 +265,8 @@ INDEX_HTML = """
 </script>
 </body></html>
 """
-(templates.get_template("index.html") if "templates" in globals() and templates else (TEMPLATES_DIR / "index.html")).write_text(INDEX_HTML, encoding="utf-8")
+# --- FIX: This line is simplified to just write the file, solving the error ---
+(TEMPLATES_DIR / "index.html").write_text(INDEX_HTML, encoding="utf-8")
 
 # --- API Endpoints ---
 @app.get("/", response_class=HTMLResponse)
