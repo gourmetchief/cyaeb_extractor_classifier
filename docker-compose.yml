@@ -3,7 +3,6 @@ version: '3.8'
 services:
   # -----------------------------------------------------------------
   # Service 1: Gluetun VPN Client 🚀
-  # Routes all mirroring traffic through the VPN.
   # -----------------------------------------------------------------
   gluetun:
     image: qmcgaw/gluetun:latest
@@ -14,8 +13,6 @@ services:
       - NET_ADMIN
     devices:
       - /dev/net/tun:/dev/net/tun
-    # --- FIX: Moved the port mapping here from the mirror-cockpit service ---
-    # This allows you to access the web UI through the VPN container's network.
     ports:
       - "${WEBUI_PORT:-8094}:8000"
     environment:
@@ -35,27 +32,23 @@ services:
 
   # -----------------------------------------------------------------
   # Service 2: The Website Mirror Cockpit 🖥️
-  # This single service runs the UI, manages the wget process,
-  # and serves the mirrored content.
   # -----------------------------------------------------------------
   mirror-cockpit:
     build:
-      context: . # Builds the new Dockerfile
-    image: website-mirror-cockpit:latest # Gives the new image a name
+      context: .
+    image: website-mirror-cockpit:latest
+    # --- FIX: Prevents Portainer from trying to pull the local image ---
+    pull_policy: never
     container_name: mirror-cockpit-app
     restart: unless-stopped
-    # The default CMD is not set in the new Dockerfile, so we specify it here.
     command: ["/usr/local/bin/uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8000"]
     network_mode: "service:gluetun"
     depends_on:
       gluetun:
         condition: service_healthy
     volumes:
-      # Use a named volume for the mirrored output data
       - mirror_data:/data/output
-      # Use a named volume for logs, status, and the uploaded CSV
       - app_state:/data
-    # --- FIX: Removed the conflicting 'ports' section from this service ---
 
 # -----------------------------------------------------------------
 # Define the volumes used by the services
