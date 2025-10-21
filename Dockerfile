@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1
 FROM python:3.12-slim
 
-# --- Install wget for website mirroring ---
+# --- Install system dependencies ---
 RUN apt-get update && apt-get install -y wget && rm -rf /var/lib/apt/lists/*
+
+# --- FIX: Create a non-root user for security ---
+RUN groupadd -r appuser && useradd --no-log-init -r -g appuser appuser
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -11,12 +14,13 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# ---- Python dependencies for the new cockpit UI ----
+# ---- Python dependencies. Added gunicorn for robustness ----
 RUN <<'EOF' bash
 set -e
 cat > /app/requirements.txt <<'REQS'
 fastapi==0.115.5
 uvicorn[standard]==0.31.1
+gunicorn==22.0.0
 Jinja2==3.1.4
 python-multipart==0.0.9
 aiofiles==24.1.0
@@ -40,12 +44,17 @@ import io
 import zipfile
 from pathlib import Path
 import httpx
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException, WebSocket
+import logging
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, WebSocket, Response
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
 import aiofiles
+
+# --- FIX: Set up proper logging for better debugging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log = logging.getLogger(__name__)
 
 # --- Configuration ---
 DATA_DIR = Path("/data")
@@ -69,16 +78,19 @@ def get_status():
         return {"status": "idle", "pid": None}
 
 def set_status(status, pid=None):
+    log.info(f"Updating status to: {status}, PID: {pid}")
     STATUS_FILE_PATH.write_text(json.dumps({"status": status, "pid": pid}))
 
 # --- App Lifespan ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    log.info("Starting up Mirror Cockpit...")
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     set_status("idle")
     yield
+    log.info("Shutting down Mirror Cockpit...")
     set_status("idle")
 
 # --- FastAPI App Initialization ---
@@ -89,10 +101,10 @@ app.mount("/sites", StaticFiles(directory=OUTPUT_DIR), name="sites")
 # --- Background Mirroring Task ---
 async def run_mirror_process():
     if not URLS_CSV_PATH.exists():
+        log.error("urls.csv not found. Aborting mirror process.")
         set_status("error", "urls.csv not found")
         return
 
-    # --- FIX: Clear previous log before starting ---
     if LOG_FILE_PATH.exists():
         LOG_FILE_PATH.unlink()
 
@@ -105,22 +117,25 @@ async def run_mirror_process():
     ]
     
     process = None
-    # --- FIX: Added try/except/finally for robust error handling ---
     try:
+        log.info(f"Executing wget command: {' '.join(command)}")
         process = await asyncio.create_subprocess_exec(*command)
         set_status("mirroring", process.pid)
         await process.wait()
+        log.info(f"Wget process finished with exit code: {process.returncode}")
         set_status("finished" if process.returncode == 0 else f"error: wget exited with code {process.returncode}")
     except Exception as e:
-        print(f"Error running mirror process: {e}")
+        log.error(f"Error running mirror process: {e}", exc_info=True)
         set_status("error", str(e))
     finally:
         if process and process.returncode is None:
+            log.warning(f"Terminating runaway process PID {process.pid}")
             process.terminate()
             await process.wait()
 
-# --- HTML Template with a beautiful UI ---
-INDEX_HTML = """
+# --- HTML Template (unchanged, but placed in its own file creation step) ---
+RUN <<'HTML' bash
+cat > /app/templates/index.html <<'HTMLCODE'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -237,15 +252,23 @@ INDEX_HTML = """
     }
 
     async function fetchInitialData() {
-        const statusRes = await fetch('/status'); updateUI(await statusRes.json());
-        const sitesRes = await fetch('/sites-list'); updateSitesTable(await sitesRes.json());
-        const csvRes = await fetch('/csv-status'); csvStatus.textContent = (await csvRes.json()).message;
-        const vpnRes = await fetch('/vpn-status'); updateVpnUI(await vpnRes.json());
+        try {
+            const statusRes = await fetch('/status'); updateUI(await statusRes.json());
+            const sitesRes = await fetch('/sites-list'); updateSitesTable(await sitesRes.json());
+            const csvRes = await fetch('/csv-status'); csvStatus.textContent = (await csvRes.json()).message;
+            const vpnRes = await fetch('/vpn-status'); updateVpnUI(await vpnRes.json());
+        } catch (error) {
+            console.error("Failed to fetch initial data:", error);
+        }
     }
     
     setInterval(async () => {
-        const vpnRes = await fetch('/vpn-status');
-        updateVpnUI(await vpnRes.json());
+        try {
+            const vpnRes = await fetch('/vpn-status');
+            updateVpnUI(await vpnRes.json());
+        } catch (error) {
+            console.error("Failed to fetch VPN status:", error);
+        }
     }, 10000); // Check VPN status every 10 seconds
 
     function updateSitesTable(sites) {
@@ -262,7 +285,7 @@ INDEX_HTML = """
     function connectWebSocket() {
         const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
         const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws/status`);
-        ws.onopen = () => logViewer.textContent = 'Log stream connected.\\n';
+        ws.onopen = () => { logViewer.textContent = 'Log stream connected.\\n'; };
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
             if (data.type === 'status') {
@@ -275,19 +298,29 @@ INDEX_HTML = """
                 logViewer.scrollTop = logViewer.scrollHeight;
             }
         };
+        ws.onerror = (error) => { console.error('WebSocket Error:', error); };
         ws.onclose = () => { logViewer.textContent += '\\nConnection closed. Reconnecting in 5s...'; setTimeout(connectWebSocket, 5000); };
     }
 
     document.addEventListener('DOMContentLoaded', () => { fetchInitialData(); connectWebSocket(); });
 </script>
 </body></html>
-"""
-(TEMPLATES_DIR / "index.html").write_text(INDEX_HTML, encoding="utf-8")
+HTMLCODE
+HTML
+
+# ---------- server.py continued... ----------
+RUN <<'PY' bash
+cat >> /app/app/server.py <<'PYCODE'
 
 # --- API Endpoints ---
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
+
+# --- FIX: Added a healthcheck endpoint for Docker ---
+@app.get("/health", status_code=200)
+async def health_check():
+    return {"status": "ok"}
 
 @app.get("/status", response_class=JSONResponse)
 async def get_status_endpoint():
@@ -310,36 +343,48 @@ async def get_vpn_status():
                 "location": f"{data.get('city', '')}, {data.get('country', '')}"
             }
     except Exception as e:
+        log.warning(f"VPN status check failed: {e}")
         return {"status": "Disconnected", "ip": "Error", "location": str(e)}
 
 @app.post("/start")
 async def start_mirroring():
-    # --- FIX: Use a lock to prevent race conditions ---
+    log.info("Received request to start mirroring.")
     async with mirror_lock:
         if get_status()['status'] == 'mirroring':
+            log.warning("Attempted to start mirroring process while one is already running.")
             raise HTTPException(409, "Mirroring process is already running.")
         asyncio.create_task(run_mirror_process())
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/stop")
 async def stop_mirroring():
+    log.info("Received request to stop mirroring.")
     status = get_status()
-    if status['status'] != 'mirroring' or not status['pid']:
+    pid = status.get('pid')
+    if status.get('status') != 'mirroring' or not pid:
+        log.warning("Attempted to stop mirroring process but none was running.")
         raise HTTPException(404, "No mirroring process is running.")
     try:
-        os.kill(status['pid'], 15) # SIGTERM
+        os.kill(pid, 15) # SIGTERM
+        log.info(f"Sent SIGTERM to process {pid}")
         set_status("idle")
     except ProcessLookupError:
+        log.warning(f"Process {pid} not found, it may have already finished.")
         set_status("idle")
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
-        raise HTTPException(400, "Invalid file type.")
-    # --- FIX: Use aiofiles for non-blocking file writes ---
-    async with aiofiles.open(URLS_CSV_PATH, "wb") as buffer:
-        await buffer.write(await file.read())
+        raise HTTPException(400, "Invalid file type. Please upload a .csv file.")
+    try:
+        async with aiofiles.open(URLS_CSV_PATH, "wb") as buffer:
+            content = await file.read()
+            await buffer.write(content)
+        log.info(f"Successfully uploaded '{file.filename}' to {URLS_CSV_PATH}")
+    except Exception as e:
+        log.error(f"Failed to write uploaded file: {e}", exc_info=True)
+        raise HTTPException(500, "Could not save uploaded file.")
     return RedirectResponse(url="/", status_code=303)
 
 @app.get("/sites-list", response_class=JSONResponse)
@@ -356,7 +401,6 @@ async def get_sites_list():
 @app.get("/download/{site_name}")
 def download_zip(site_name: str):
     site_path = (OUTPUT_DIR / site_name).resolve()
-    # --- FIX: Security check to prevent path traversal ---
     if not site_path.is_dir() or OUTPUT_DIR.resolve() not in site_path.parents:
         raise HTTPException(404, "Site not found or access denied")
     
@@ -370,12 +414,12 @@ def download_zip(site_name: str):
 @app.websocket("/ws/status")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
+    log.info("WebSocket client connected.")
     last_pos = 0
     try:
         while True:
             await websocket.send_json({"type": "status", "payload": get_status()})
             if LOG_FILE_PATH.exists():
-                # --- FIX: Use aiofiles for non-blocking file reads ---
                 async with aiofiles.open(LOG_FILE_PATH, 'r') as f:
                     await f.seek(last_pos)
                     if new_lines := await f.read():
@@ -383,6 +427,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         last_pos = await f.tell()
             await asyncio.sleep(2)
     except Exception:
-        print("WebSocket client disconnected.")
+        log.info("WebSocket client disconnected.")
 PYCODE
 PY
+
+# --- FIX: Set correct permissions and switch to non-root user ---
+RUN chown -R appuser:appuser /app /data
+USER appuser
