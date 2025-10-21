@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  # -----------------------------------------------------------------
+  # Service 1: Gluetun VPN Client 🚀
+  # Routes all mirroring traffic through the VPN.
+  # -----------------------------------------------------------------
+  gluetun:
+    image: qmcgaw/gluetun:latest
+    container_name: mirror-cockpit-vpn
+    pull_policy: always
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      - VPN_SERVICE_PROVIDER=nordvpn
+      - VPN_TYPE=openvpn
+      - OPENVPN_USER=${OPENVPN_USER}
+      - OPENVPN_PASSWORD=${OPENVPN_PASSWORD}
+      - OPENVPN_PROTOCOL=tcp
+      - OPENVPN_CUSTOM_PORT=443
+      - SERVER_COUNTRIES=${SERVER_COUNTRIES}
+    healthcheck:
+      test: ["CMD-SHELL", "ip a | grep -q tun0 || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+
+  # -----------------------------------------------------------------
+  # Service 2: The Website Mirror Cockpit 🖥️
+  # This single service runs the UI, manages the wget process,
+  # and serves the mirrored content.
+  # -----------------------------------------------------------------
+  mirror-cockpit:
+    build:
+      context: . # Builds the new Dockerfile
+    image: website-mirror-cockpit:latest # Gives the new image a name
+    container_name: mirror-cockpit-app
+    restart: unless-stopped
+    # The default CMD is not set in the new Dockerfile, so we specify it here.
+    command: ["/usr/local/bin/uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8000"]
+    network_mode: "service:gluetun"
+    depends_on:
+      gluetun:
+        condition: service_healthy
+    volumes:
+      # Use a named volume for the mirrored output data
+      - mirror_data:/data/output
+      # Use a named volume for logs, status, and the uploaded CSV
+      - app_state:/data
+    ports:
+      # The web UI is accessed on your host machine
+      - "${WEBUI_PORT:-8094}:8000"
+
+# -----------------------------------------------------------------
+# Define the volumes used by the services
+# -----------------------------------------------------------------
+volumes:
+  mirror_data:
+  app_state:
