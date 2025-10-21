@@ -43,16 +43,13 @@ from typing import Optional, Tuple, List, Dict
 from dateutil import parser as dateparser
 from bs4 import BeautifulSoup
 
-# ---------- Helpers ----------
 def norm(s: Optional[str]) -> Optional[str]:
     if s is None: return None
     return re.sub(r"\s+", " ", s).strip()
 
 def parse_date_safe(s: str) -> Optional[str]:
-    try:
-        return dateparser.parse(s, dayfirst=False, yearfirst=False, fuzzy=True).date().isoformat()
-    except Exception:
-        return None
+    try: return dateparser.parse(s, dayfirst=False, yearfirst=False, fuzzy=True).date().isoformat()
+    except Exception: return None
 
 def canonical_status(label: str) -> str:
     t = (label or "").lower()
@@ -84,7 +81,6 @@ def split_route(locs: str) -> Tuple[Optional[str], Optional[str], Optional[str]]
     first_norm = norm(first)
     return first_norm, None, first_norm
 
-# ---------- Core parsing function (adapted for HTML) ----------
 def parse_html_for_dates(html_content: str, yacht_name: str, source_url: str) -> List[Dict]:
     soup = BeautifulSoup(html_content, 'html.parser')
     text = soup.get_text()
@@ -92,12 +88,9 @@ def parse_html_for_dates(html_content: str, yacht_name: str, source_url: str) ->
     
     availability_rows = []
     for m in BLOCK_INLINE_RE.finditer(text):
-        start_iso = parse_date_safe(m.group("start"))
-        end_iso   = parse_date_safe(m.group("end"))
+        start_iso, end_iso = parse_date_safe(m.group("start")), parse_date_safe(m.group("end"))
         if not (start_iso and end_iso): continue
-
         from_loc, to_loc, route = split_route(m.group("locs"))
-
         availability_rows.append({
             "yacht_name": yacht_name, "status": canonical_status(m.group("status")),
             "start_date": start_iso, "end_date": end_iso,
@@ -110,44 +103,34 @@ PARSER
 # --- Create the main server.py file ---
 RUN <<'PY' bash
 cat > /app/app/server.py <<'PYCODE'
-import asyncio
-import os
-import json
-import io
-import zipfile
+import asyncio, os, json, io, zipfile, logging
 from pathlib import Path
-import httpx
-import logging
-import pandas as pd
+from urllib.parse import urlparse
+import httpx, pandas as pd, aiofiles
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, WebSocket
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
-import aiofiles
 from app.cyaeb_availability_parser import parse_html_for_dates
-from urllib.parse import urlparse
-from fastapi.middleware.cors import CORSMiddleware # --- FIX: Import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
 
-# --- Configuration ---
 DATA_DIR = Path("/data")
 INPUT_DIR, OUTPUT_DIR, LOG_DIR = DATA_DIR / "input", DATA_DIR / "output", DATA_DIR / "logs"
 URLS_CSV_PATH, FILTERED_URLS_PATH = INPUT_DIR / "urls.csv", INPUT_DIR / "filtered_urls.txt"
-AVAILABILITY_DATA_PATH = DATA_DIR / "availability.json"
-YACHTS_MANIFEST_PATH = DATA_DIR / "yachts_manifest.json"
+AVAILABILITY_DATA_PATH, YACHTS_MANIFEST_PATH = DATA_DIR / "availability.json", DATA_DIR / "yachts_manifest.json"
 LOG_FILE_PATH, STATUS_FILE_PATH = LOG_DIR / "mirror.log", DATA_DIR / "status.json"
 TEMPLATES_DIR = Path("/app/templates")
 
-mirror_lock = asyncio.Lock()
-url_to_name_map = {}
+mirror_lock, url_to_name_map = asyncio.Lock(), {}
 
 def get_status():
     if not STATUS_FILE_PATH.exists(): return {"status": "idle", "pid": None}
     try: return json.loads(STATUS_FILE_PATH.read_text())
-    except (json.JSONDecodeError, FileNotFoundError): return {"status": "idle", "pid": None}
+    except: return {"status": "idle", "pid": None}
 
 def set_status(status, pid=None):
     log.info(f"Updating status to: {status}, PID: {pid}")
@@ -163,134 +146,74 @@ async def lifespan(app: FastAPI):
     log.info("Shutting down Mirror Cockpit..."); set_status("idle")
 
 app = FastAPI(title="Website Mirror Cockpit", lifespan=lifespan)
-
-# --- FIX: Add CORS Middleware to allow all origins for WebSocket connections ---
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-app.mount("/sites", StaticFiles(directory=OUTPUT_DIR), name="sites")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR)); app.mount("/sites", StaticFiles(directory=OUTPUT_DIR), name="sites")
 
 def get_url_path_key(url_str: str) -> str:
-    try:
-        p = urlparse(url_str)
-        path = p.path.strip('/')
-        return f"{p.netloc}/{path}/"
-    except:
-        return url_str
+    try: p = urlparse(url_str); path = p.path.strip('/'); return f"{p.netloc}/{path}/"
+    except: return url_str
 
 async def post_process_mirrored_data():
     log.info("Starting post-processing of mirrored data...")
-    yacht_manifest, all_availability = [], []
-    html_files = list(OUTPUT_DIR.rglob("*.html"))
+    yacht_manifest, all_availability, html_files = [], [], list(OUTPUT_DIR.rglob("*.html"))
     log.info(f"Found {len(html_files)} HTML files to process.")
-
     for html_file in html_files:
         try:
-            relative_path = html_file.relative_to(OUTPUT_DIR)
-            url_key = str(relative_path).replace("index.html", "")
-            
+            relative_path = html_file.relative_to(OUTPUT_DIR); url_key = str(relative_path).replace("index.html", "")
             yacht_name = url_to_name_map.get(url_key)
-            if not yacht_name:
-                log.warning(f"No yacht name found for file: {html_file}. Skipping.")
-                continue
-
-            async with aiofiles.open(html_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = await f.read()
-            
+            if not yacht_name: log.warning(f"No name found for file: {html_file}. Skipping."); continue
+            async with aiofiles.open(html_file, 'r', encoding='utf-8', errors='ignore') as f: content = await f.read()
             avail_rows = parse_html_for_dates(content, yacht_name, url_key)
-            
-            yacht_manifest.append({
-                "yacht_name": yacht_name, "file_path": str(relative_path),
-                "domain": str(relative_path.parts[0])
-            })
-            if avail_rows:
-                all_availability.extend(avail_rows)
-        except Exception as e:
-            log.warning(f"Could not process file {html_file}: {e}")
-
-    async with aiofiles.open(YACHTS_MANIFEST_PATH, 'w') as f:
-        await f.write(json.dumps(sorted(yacht_manifest, key=lambda x: x['yacht_name']), indent=2))
-    async with aiofiles.open(AVAILABILITY_DATA_PATH, 'w') as f:
-        await f.write(json.dumps(all_availability, indent=2))
-    
+            yacht_manifest.append({"yacht_name": yacht_name, "file_path": str(relative_path), "domain": str(relative_path.parts[0])})
+            if avail_rows: all_availability.extend(avail_rows)
+        except Exception as e: log.warning(f"Could not process file {html_file}: {e}")
+    async with aiofiles.open(YACHTS_MANIFEST_PATH, 'w') as f: await f.write(json.dumps(sorted(yacht_manifest, key=lambda x: x['yacht_name']), indent=2))
+    async with aiofiles.open(AVAILABILITY_DATA_PATH, 'w') as f: await f.write(json.dumps(all_availability, indent=2))
     log.info(f"Created manifest for {len(yacht_manifest)} yachts and {len(all_availability)} availability records.")
 
 async def run_mirror_process():
     global url_to_name_map
     try:
         if not URLS_CSV_PATH.exists(): raise FileNotFoundError("urls.csv not found.")
-        df = pd.read_csv(URLS_CSV_PATH)
-        
-        df_valid = df[df['status_code'] == 200].copy()
+        df = pd.read_csv(URLS_CSV_PATH); df_valid = df[df['status_code'] == 200].copy()
         df_valid['url_key'] = df_valid['final_url'].apply(get_url_path_key)
         df_valid['yacht_name'] = df_valid['title'].str.replace(' Yacht Charters', '', regex=False).str.strip()
         url_to_name_map = pd.Series(df_valid.yacht_name.values, index=df_valid.url_key).to_dict()
         urls_to_mirror = df_valid['final_url'].dropna().unique().tolist()
-        
-        if not urls_to_mirror:
-            log.warning("No URLs with status_code 200 found."); set_status("finished", "No valid URLs")
-            return
-            
-        async with aiofiles.open(FILTERED_URLS_PATH, 'w') as f:
-            await f.write("\n".join(urls_to_mirror))
+        if not urls_to_mirror: log.warning("No URLs with status_code 200 found."); set_status("finished", "No valid URLs"); return
+        async with aiofiles.open(FILTERED_URLS_PATH, 'w') as f: await f.write("\n".join(urls_to_mirror))
         log.info(f"Found {len(urls_to_mirror)} URLs to mirror.")
-    except Exception as e:
-        log.error(f"CSV Error: {e}", exc_info=True); set_status("error", f"CSV Error: {e}")
-        return
-
+    except Exception as e: log.error(f"CSV Error: {e}", exc_info=True); set_status("error", f"CSV Error: {e}"); return
     if LOG_FILE_PATH.exists(): LOG_FILE_PATH.unlink()
-    
-    command = ["wget", "--mirror", "--page-requisites", "--adjust-extension", "--convert-links",
-               "--span-hosts", "--no-parent", "--directory-prefix", str(OUTPUT_DIR), "--input-file",
-               str(FILTERED_URLS_PATH), "--no-check-certificate", "-e", "robots=off", "--timeout=30",
-               "--tries=3", "--user-agent", "Mozilla/5.0", "--append-output", str(LOG_FILE_PATH)]
-    
+    command = ["wget", "--mirror", "--page-requisites", "--adjust-extension", "--convert-links", "--span-hosts", "--no-parent", "--directory-prefix", str(OUTPUT_DIR), "--input-file", str(FILTERED_URLS_PATH), "--no-check-certificate", "-e", "robots=off", "--timeout=30", "--tries=3", "--user-agent", "Mozilla/5.0", "--append-output", str(LOG_FILE_PATH)]
     process = None
     try:
         log.info(f"Executing wget..."); process = await asyncio.create_subprocess_exec(*command)
         set_status("mirroring", process.pid); await process.wait()
-        
-        if process.returncode == 0:
-            log.info("Wget finished. Starting post-processing..."); await post_process_mirrored_data()
-            set_status("finished")
-        else:
-            log.error(f"Wget failed with exit code: {process.returncode}")
-            set_status("error", f"wget exited with code {process.returncode}")
-    except Exception as e:
-        log.error(f"Mirror process error: {e}", exc_info=True); set_status("error", str(e))
+        if process.returncode == 0: log.info("Wget finished. Starting post-processing..."); await post_process_mirrored_data(); set_status("finished")
+        else: log.error(f"Wget failed with exit code: {process.returncode}"); set_status("error", f"wget exited with code {process.returncode}")
+    except Exception as e: log.error(f"Mirror process error: {e}", exc_info=True); set_status("error", str(e))
     finally:
-        if process and process.returncode is None:
-            log.warning(f"Terminating runaway process PID {process.pid}"); process.terminate(); await process.wait()
+        if process and process.returncode is None: log.warning(f"Terminating runaway process PID {process.pid}"); process.terminate(); await process.wait()
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request): return templates.TemplateResponse("index.html", {"request": request})
-
 @app.get("/availability", response_class=HTMLResponse)
 async def avail_page(request: Request): return templates.TemplateResponse("availability.html", {"request": request})
-
 @app.get("/availability-data", response_class=JSONResponse)
 async def get_avail_data():
     if not AVAILABILITY_DATA_PATH.exists(): return []
     async with aiofiles.open(AVAILABILITY_DATA_PATH, 'r') as f: return json.loads(await f.read())
-
 @app.get("/sites-list", response_class=JSONResponse)
 async def get_sites_list():
     if not YACHTS_MANIFEST_PATH.exists(): return []
     async with aiofiles.open(YACHTS_MANIFEST_PATH, 'r') as f: return json.loads(await f.read())
-
 @app.post("/start")
 async def start_mirroring():
     async with mirror_lock:
         if get_status()['status'] == 'mirroring': raise HTTPException(409, "Mirroring already running.")
         asyncio.create_task(run_mirror_process())
     return RedirectResponse(url="/", status_code=303)
-
 @app.post("/stop")
 async def stop_mirroring():
     status = get_status()
@@ -298,7 +221,6 @@ async def stop_mirroring():
     try: os.kill(status['pid'], 15); set_status("idle")
     except ProcessLookupError: set_status("idle")
     return RedirectResponse(url="/", status_code=303)
-
 @app.get("/download/{domain_name}")
 def download_zip(domain_name: str):
     site_path = (OUTPUT_DIR / domain_name).resolve()
@@ -308,33 +230,24 @@ def download_zip(domain_name: str):
         for file in site_path.rglob("*"): zf.write(file, file.relative_to(site_path))
     zip_buffer.seek(0)
     return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename={domain_name}.zip"})
-
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'): raise HTTPException(400, "Invalid file type.")
     async with aiofiles.open(URLS_CSV_PATH, "wb") as buffer: await buffer.write(await file.read())
     return RedirectResponse(url="/", status_code=303)
-
 @app.api_route("/health", methods=["GET", "HEAD"], status_code=200)
 async def health_check(): return {"status": "ok"}
-
 @app.get("/status", response_class=JSONResponse)
 async def get_status_endpoint(): return get_status()
-
 @app.get("/csv-status", response_class=JSONResponse)
-async def get_csv_status():
-    return {"message": f"'{URLS_CSV_PATH.name}' is ready."} if URLS_CSV_PATH.exists() else {"message": "No CSV uploaded yet."}
-
+async def get_csv_status(): return {"message": f"'{URLS_CSV_PATH.name}' is ready."} if URLS_CSV_PATH.exists() else {"message": "No CSV uploaded yet."}
 @app.get("/vpn-status", response_class=JSONResponse)
 async def get_vpn_status():
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.get("https://ipinfo.io/json", timeout=5)
-            resp.raise_for_status(); data = resp.json()
+            resp = await client.get("https://ipinfo.io/json", timeout=5); resp.raise_for_status(); data = resp.json()
             return {"status": "Connected", "ip": data.get("ip"), "location": f"{data.get('city', '')}, {data.get('country', '')}"}
-    except Exception as e:
-        log.warning(f"VPN check failed: {e}"); return {"status": "Disconnected", "ip": "Error", "location": str(e)}
-
+    except Exception as e: log.warning(f"VPN check failed: {e}"); return {"status": "Disconnected", "ip": "Error", "location": str(e)}
 @app.websocket("/ws/status")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept(); log.info("WebSocket client connected."); last_pos = 0
@@ -354,265 +267,13 @@ PY
 # --- Create the main index.html template file ---
 RUN <<'HTML' bash
 cat > /app/templates/index.html <<'HTMLCODE'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Website Mirror Cockpit</title>
-    <style>
-        :root { --primary-color: #3498db; --secondary-color: #2c3e50; --success-color: #2ecc71; --warning-color: #f39c12; --danger-color: #e74c3c; --white: #fff; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f8f9fa; line-height: 1.6; }
-        .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(350px, 1fr)); gap: 2rem; }
-        .card { background: var(--white); border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
-        .card-header { padding: 1.5rem; background: var(--secondary-color); color: var(--white); display: flex; justify-content: space-between; align-items: center; border-radius: 8px 8px 0 0;}
-        .card-header h2 { margin: 0; font-size: 1.25rem; }
-        .card-body { padding: 1.5rem; }
-        h1 { color: var(--secondary-color); text-align: center; margin-bottom: 2rem; }
-        .status-bar { display: flex; align-items: center; gap: 1rem; }
-        .status-indicator { display: flex; align-items: center; gap: 0.5rem; font-weight: bold; padding: 0.5rem 1rem; border-radius: 20px; color: var(--white); }
-        .status-indicator.idle { background-color: var(--primary-color); }
-        .status-indicator.mirroring { background-color: var(--warning-color); }
-        .status-indicator.finished { background-color: var(--success-color); }
-        .status-indicator.error { background-color: var(--danger-color); }
-        .status-indicator .dot { width: 12px; height: 12px; border-radius: 50%; background: currentColor; }
-        .vpn-info { font-size: 0.9rem; color: #7f8c8d; }
-        .button, .button-group { display: flex; gap: 1rem; margin-top: 1rem; }
-        button, a.button, input[type=submit] { background-color: var(--primary-color); color: var(--white); border: none; padding: 10px 18px; border-radius: 5px; cursor: pointer; font-size: 1rem; font-weight: 500; text-decoration: none; transition: background-color 0.2s; }
-        button:hover, a.button:hover, input[type=submit]:hover { background-color: #2980b9; }
-        button:disabled { background-color: #bdc3c7; cursor: not-allowed; }
-        #log-viewer { background: #282c34; color: #abb2bf; font-family: monospace; padding: 1rem; border-radius: 5px; height: 300px; overflow-y: auto; margin-top: 1rem; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { padding: 12px 15px; border-bottom: 1px solid #e0e0e0; text-align: left;}
-        th { background-color: #f2f2f2; font-weight: 600; }
-        tr:last-child td { border-bottom: none; }
-        a { color: var(--primary-color); font-weight: 500; }
-    </style>
-</head>
-<body>
-<div class="container">
-    <h1>Website Mirror Cockpit</h1>
-    <div class="grid">
-        <div class="card"><div class="card-header"><h2>Process Control</h2></div><div class="card-body">
-            <div class="status-bar"><div id="status" class="status-indicator idle"><div class="dot"></div><span>Idle</span></div></div>
-            <div class="button-group">
-                <form action="/start" method="post"><button id="startButton">Start Mirroring</button></form>
-                <form action="/stop" method="post"><button id="stopButton" disabled>Stop Mirroring</button></form>
-            </div>
-            <div id="log-viewer">Connecting to log stream...</div>
-        </div></div>
-        <div class="card"><div class="card-header"><h2>System Status</h2></div><div class="card-body">
-            <div class="status-bar"><div id="vpn-connection-status" class="status-indicator"><div id="vpn-dot" class="dot"></div><span id="vpn-status-text">Checking...</span></div></div>
-            <p class="vpn-info"><strong>Public IP:</strong> <span id="vpn-ip">N/A</span></p>
-            <p class="vpn-info"><strong>Location:</strong> <span id="vpn-location">N/A</span></p>
-            <hr><p>Upload a <code>urls.csv</code> file. This will overwrite any existing list.</p>
-            <form action="/upload" method="post" enctype="multipart/form-data">
-                <input type="file" name="file" accept=".csv" required> <input type="submit" value="Upload CSV">
-            </form>
-            <p id="csv-status" style="margin-top:1rem; font-style: italic;"></p>
-        </div></div>
-    </div>
-    <div class="card" style="margin-top: 2rem;">
-        <div class="card-header"><h2>Mirrored Yachts</h2><a href="/availability" class="button">View Availability Calendar</a></div>
-        <div class="card-body" style="padding: 0;"><table id="sites-table">
-            <thead><tr><th>Yacht Name</th><th>Actions</th></tr></thead>
-            <tbody><tr><td colspan="2" style="text-align: center; padding: 2rem;">No yachts mirrored yet.</td></tr></tbody>
-        </table></div>
-    </div>
-</div>
-<script>
-    const $ = id => document.getElementById(id);
-    const statusSpan = $('status'), startButton = $('startButton'), stopButton = $('stopButton');
-    const logViewer = $('log-viewer'), sitesTableBody = $('sites-table').querySelector('tbody');
-    const csvStatus = $('csv-status'), vpnStatusText = $('vpn-status-text'), vpnIp = $('vpn-ip'), vpnLocation = $('vpn-location');
-
-    function updateUI(statusData) {
-        const statusText = statusData.status.replace(/_/g, " ");
-        statusSpan.innerHTML = `<div class="dot"></div><span>${statusText}</span>`;
-        statusSpan.className = `status-indicator ${statusData.status}`;
-        startButton.disabled = statusData.status === 'mirroring';
-        stopButton.disabled = statusData.status !== 'mirroring';
-    }
-    
-    async function fetchInitialData() {
-        try {
-            const [statusRes, sitesRes, csvRes, vpnRes] = await Promise.all([ fetch('/status'), fetch('/sites-list'), fetch('/csv-status'), fetch('/vpn-status') ]);
-            updateUI(await statusRes.json());
-            updateSitesTable(await sitesRes.json());
-            csvStatus.textContent = (await csvRes.json()).message;
-            updateVpnUI(await vpnRes.json());
-        } catch (error) { console.error("Fetch initial data failed:", error); }
-    }
-    
-    function updateVpnUI(vpnData) {
-        vpnStatusText.textContent = vpnData.status;
-        vpnIp.textContent = vpnData.ip || 'N/A';
-        vpnLocation.textContent = vpnData.location || 'N/A';
-        vpnStatusText.parentElement.className = `status-indicator ${vpnData.status.toLowerCase()}`;
-    }
-    
-    function updateSitesTable(yachts) {
-        if (!yachts || yachts.length === 0) {
-            sitesTableBody.innerHTML = '<tr><td colspan="2" style="text-align: center; padding: 2rem;">No yachts mirrored yet. Run a mirror to see results.</td></tr>'; return;
-        }
-        sitesTableBody.innerHTML = yachts.map(yacht => 
-            `<tr>
-                <td>${yacht.yacht_name}</td>
-                <td>
-                    <a href="/sites/${yacht.file_path}" target="_blank">View Page</a> | 
-                    <a href="/download/${yacht.domain}">Download Domain ZIP</a>
-                </td>
-            </tr>`
-        ).join('');
-    }
-
-    function connectWebSocket() {
-        const ws = new WebSocket(`${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}/ws/status`);
-        ws.onopen = () => { logViewer.textContent = 'Log stream connected.\\n'; };
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.type === 'status') {
-                updateUI(data.payload);
-                if (data.payload.status === 'finished' || data.payload.status.startsWith('error')) {
-                    fetchInitialData();
-                }
-            } else if (data.type === 'log') {
-                logViewer.textContent += data.payload;
-                logViewer.scrollTop = logViewer.scrollHeight;
-            }
-        };
-        ws.onclose = () => { logViewer.textContent += '\\nConnection closed. Reconnecting in 5s...'; setTimeout(connectWebSocket, 5000); };
-    }
-
-    setInterval(() => fetch('/vpn-status').then(r=>r.json()).then(updateVpnUI).catch(e=>console.error("VPN fetch failed:", e)), 10000);
-    document.addEventListener('DOMContentLoaded', () => { fetchInitialData(); connectWebSocket(); });
-</script>
-</body></html>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Website Mirror Cockpit</title><style>:root{--primary-color:#3498db;--secondary-color:#2c3e50;--success-color:#2ecc71;--warning-color:#f39c12;--danger-color:#e74c3c;--white:#fff}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f8f9fa;line-height:1.6}.container{max-width:1200px;margin:2rem auto;padding:0 1rem}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:2rem}.card{background:var(--white);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.08)}.card-header{padding:1.5rem;background:var(--secondary-color);color:var(--white);display:flex;justify-content:space-between;align-items:center;border-radius:8px 8px 0 0}.card-header h2{margin:0;font-size:1.25rem}.card-body{padding:1.5rem}h1{color:var(--secondary-color);text-align:center;margin-bottom:2rem}.status-bar{display:flex;align-items:center;gap:1rem}.status-indicator{display:flex;align-items:center;gap:.5rem;font-weight:700;padding:.5rem 1rem;border-radius:20px;color:var(--white)}.status-indicator.idle{background-color:var(--primary-color)}.status-indicator.mirroring{background-color:var(--warning-color)}.status-indicator.finished{background-color:var(--success-color)}.status-indicator.error{background-color:var(--danger-color)}.status-indicator .dot{width:12px;height:12px;border-radius:50%;background:currentColor}.vpn-info{font-size:.9rem;color:#7f8c8d}.button,.button-group{display:flex;gap:1rem;margin-top:1rem}button,a.button,input[type=submit]{background-color:var(--primary-color);color:var(--white);border:none;padding:10px 18px;border-radius:5px;cursor:pointer;font-size:1rem;font-weight:500;text-decoration:none;transition:background-color .2s}button:hover,a.button:hover,input[type=submit]:hover{background-color:#2980b9}button:disabled{background-color:#bdc3c7;cursor:not-allowed}#log-viewer{background:#282c34;color:#abb2bf;font-family:monospace;padding:1rem;border-radius:5px;height:300px;overflow-y:auto;margin-top:1rem}table{width:100%;border-collapse:collapse}th,td{padding:12px 15px;border-bottom:1px solid #e0e0e0;text-align:left}th{background-color:#f2f2f2;font-weight:600}tr:last-child td{border-bottom:none}a{color:var(--primary-color);font-weight:500}</style></head><body><div class="container"><h1>Website Mirror Cockpit</h1><div class="grid"><div class="card"><div class="card-header"><h2>Process Control</h2></div><div class="card-body"><div class="status-bar"><div id="status" class="status-indicator idle"><div class="dot"></div><span>Idle</span></div></div><div class="button-group"><form action="/start" method="post"><button id="startButton">Start Mirroring</button></form><form action="/stop" method="post"><button id="stopButton" disabled>Stop Mirroring</button></form></div><div id="log-viewer">Connecting to log stream...</div></div></div><div class="card"><div class="card-header"><h2>System Status</h2></div><div class="card-body"><div class="status-bar"><div id="vpn-connection-status" class="status-indicator"><div id="vpn-dot" class="dot"></div><span id="vpn-status-text">Checking...</span></div></div><p class="vpn-info"><strong>Public IP:</strong> <span id="vpn-ip">N/A</span></p><p class="vpn-info"><strong>Location:</strong> <span id="vpn-location">N/A</span></p><hr><p>Upload a <code>urls.csv</code> file. This will overwrite any existing list.</p><form action="/upload" method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".csv" required> <input type="submit" value="Upload CSV"></form><p id="csv-status" style="margin-top:1rem;font-style:italic"></p></div></div></div><div class="card" style="margin-top:2rem"><div class="card-header"><h2>Mirrored Yachts</h2><a href="/availability" class="button">View Availability Calendar</a></div><div class="card-body" style="padding:0"><table id="sites-table"><thead><tr><th>Yacht Name</th><th>Actions</th></tr></thead><tbody><tr><td colspan="2" style="text-align:center;padding:2rem">No yachts mirrored yet.</td></tr></tbody></table></div></div></div><script>const $ = id => document.getElementById(id);const statusSpan=$("status"),startButton=$("startButton"),stopButton=$("stopButton"),logViewer=$("log-viewer"),sitesTableBody=$("sites-table").querySelector("tbody"),csvStatus=$("csv-status"),vpnStatusText=$("vpn-status-text"),vpnIp=$("vpn-ip"),vpnLocation=$("vpn-location");function updateUI(e){const t=e.status.replace(/_/g," ");statusSpan.innerHTML=`<div class="dot"></div><span>${t}</span>`,statusSpan.className=`status-indicator ${e.status}`,startButton.disabled="mirroring"===e.status,stopButton.disabled!=="mirroring"===e.status}async function fetchInitialData(){try{const[e,t,o,a]=await Promise.all([fetch("/status"),fetch("/sites-list"),fetch("/csv-status"),fetch("/vpn-status")]);updateUI(await e.json()),updateSitesTable(await t.json()),csvStatus.textContent=(await o.json()).message,updateVpnUI(await a.json())}catch(e){console.error("Fetch initial data failed:",e)}}function updateVpnUI(e){vpnStatusText.textContent=e.status,vpnIp.textContent=e.ip||"N/A",vpnLocation.textContent=e.location||"N/A",vpnStatusText.parentElement.className=`status-indicator ${e.status.toLowerCase()}`}function updateSitesTable(e){sitesTableBody.innerHTML=e&&0!==e.length?e.map(e=>`<tr>\n                <td>${e.yacht_name}</td>\n                <td>\n                    <a href="/sites/${e.file_path}" target="_blank">View Page</a> | \n                    <a href="/download/${e.domain}">Download Domain ZIP</a>\n                </td>\n            </tr>`).join(""):`<tr><td colspan="2" style="text-align: center; padding: 2rem;">No yachts mirrored yet. Run a mirror to see results.</td></tr>`}function connectWebSocket(){const e=new WebSocket(`${"https:"===window.location.protocol?"wss:":"ws:"}//${window.location.host}/ws/status`);e.onopen=()=>{logViewer.textContent="Log stream connected.\\n"},e.onmessage=e=>{const t=JSON.parse(e.data);"status"===t.type?(updateUI(t.payload),("finished"===t.payload.status||t.payload.status.startsWith("error"))&&fetchInitialData()):"log"===t.type&&(logViewer.textContent+=t.payload,logViewer.scrollTop=logViewer.scrollHeight)},e.onclose=()=>{logViewer.textContent="\\nConnection closed. Reconnecting in 5s...",setTimeout(connectWebSocket,5e3)}}setInterval(()=>fetch("/vpn-status").then(e=>e.json()).then(updateVpnUI).catch(e=>console.error("VPN fetch failed:",e)),1e4),document.addEventListener("DOMContentLoaded",()=>{fetchInitialData(),connectWebSocket()})</script></body></html>
 HTMLCODE
 HTML
 
 # --- Create the new availability.html template file ---
 RUN <<'AVAILHTML' bash
 cat > /app/templates/availability.html <<'HTMLCODE'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Yacht Availability Calendar</title>
-    <style>
-        :root { --primary-color: #3498db; --secondary-color: #2c3e50; --light-gray: #ecf0f1; --white: #fff; --booked: #e74c3c; --hold: #f39c12; --available: #2ecc71; --unavailable: #95a5a6; }
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f8f9fa; color: var(--secondary-color); }
-        .container { max-width: 1200px; margin: 2rem auto; padding: 0 1rem; }
-        h1 { color: var(--secondary-color); text-align: center; margin-bottom: 1rem; }
-        .controls { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding: 1rem; background: var(--white); border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-        #month-year { font-size: 1.5rem; font-weight: 600; margin: 0.5rem 1rem; }
-        .controls button { background-color: var(--primary-color); color: var(--white); border: none; padding: 10px 18px; border-radius: 5px; cursor: pointer; font-size: 1rem; }
-        #yacht-selector { padding: 10px; border-radius: 5px; border: 1px solid #ccc; font-size: 1rem; max-width: 250px; }
-        .calendar { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
-        .day, .header { background: var(--white); padding: 10px; border-radius: 4px; min-height: 120px; display: flex; flex-direction: column; }
-        .header { min-height: auto; text-align: center; font-weight: bold; background-color: var(--secondary-color); color: var(--white); }
-        .day .date-num { font-weight: bold; margin-bottom: 5px; }
-        .day.other-month { background-color: var(--light-gray); }
-        .event-container { overflow-y: auto; flex-grow: 1; }
-        .event { font-size: 0.8rem; padding: 3px 5px; border-radius: 3px; margin-bottom: 3px; color: white; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        .event.booked { background-color: var(--booked); } .event.hold { background-color: var(--hold); } .event.available { background-color: var(--available); } .event.unavailable { background-color: var(--unavailable); } .event.unknown { background-color: #bdc3c7; }
-        #back-link { display: inline-block; margin-bottom: 1rem; font-weight: 500; color: var(--primary-color); }
-    </style>
-</head>
-<body>
-<div class="container">
-    <a href="/" id="back-link">&larr; Back to Main Cockpit</a>
-    <h1>Yacht Availability Calendar</h1>
-    <div class="controls">
-        <button id="prev-month">&lt;</button>
-        <select id="yacht-selector"><option value="">All Yachts</option></select>
-        <h2 id="month-year"></h2>
-        <button id="next-month">&gt;</button>
-    </div>
-    <div class="calendar" id="calendar-grid"></div>
-</div>
-<script>
-    document.addEventListener('DOMContentLoaded', async () => {
-        const calendarGrid = document.getElementById('calendar-grid');
-        const monthYearEl = document.getElementById('month-year');
-        const yachtSelector = document.getElementById('yacht-selector');
-        let currentDate = new Date();
-        let allEvents = [];
-        
-        const fetchData = async () => {
-            try {
-                const response = await fetch('/availability-data');
-                if (!response.ok) throw new Error('Network response was not ok');
-                allEvents = await response.json();
-                populateYachtFilter();
-                renderCalendar();
-            } catch (error) {
-                console.error("Failed to fetch availability data:", error);
-                calendarGrid.innerHTML = `<p style="grid-column: 1 / 8; text-align: center;">Could not load data. Please run a mirror process first.</p>`;
-            }
-        };
-
-        const populateYachtFilter = () => {
-            const yachtNames = [...new Set(allEvents.map(e => e.yacht_name))].sort();
-            yachtSelector.innerHTML = '<option value="">All Yachts</option>';
-            yachtNames.forEach(name => {
-                const option = document.createElement('option');
-                option.value = name; option.textContent = name;
-                yachtSelector.appendChild(option);
-            });
-        };
-
-        const renderCalendar = () => {
-            calendarGrid.innerHTML = '';
-            const month = currentDate.getMonth(), year = currentDate.getFullYear();
-            monthYearEl.textContent = `${currentDate.toLocaleString('default', { month: 'long' })} ${year}`;
-
-            const firstDay = new Date(year, month, 1), lastDay = new Date(year, month + 1, 0);
-            const startDayOfWeek = firstDay.getDay();
-
-            ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].forEach(day => {
-                const header = document.createElement('div');
-                header.className = 'header'; header.textContent = day;
-                calendarGrid.appendChild(header);
-            });
-
-            for (let i = 0; i < startDayOfWeek; i++) calendarGrid.insertAdjacentHTML('beforeend', '<div class="day other-month"></div>');
-            
-            const selectedYacht = yachtSelector.value;
-            const filteredEvents = selectedYacht ? allEvents.filter(e => e.yacht_name === selectedYacht) : allEvents;
-
-            for (let i = 1; i <= lastDay.getDate(); i++) {
-                const dayEl = document.createElement('div'); dayEl.className = 'day';
-                const dayDate = new Date(year, month, i);
-                dayEl.innerHTML = `<div class="date-num">${i}</div><div class="event-container"></div>`;
-                
-                const eventsForDay = filteredEvents.filter(event => {
-                    const startDate = new Date(event.start_date); startDate.setUTCHours(0,0,0,0);
-                    const endDate = new Date(event.end_date); endDate.setUTCHours(0,0,0,0);
-                    return dayDate >= startDate && dayDate <= endDate;
-                });
-                
-                const eventContainer = dayEl.querySelector('.event-container');
-                eventsForDay.forEach(event => {
-                    const eventEl = document.createElement('div');
-                    eventEl.className = `event ${event.status}`;
-                    eventEl.textContent = event.yacht_name;
-                    eventEl.title = `${event.yacht_name} - ${event.status.toUpperCase()}\\n${event.start_date} to ${event.end_date}`;
-                    eventContainer.appendChild(eventEl);
-                });
-                calendarGrid.appendChild(dayEl);
-            }
-        };
-
-        document.getElementById('prev-month').addEventListener('click', () => { currentDate.setMonth(currentDate.getMonth() - 1); renderCalendar(); });
-        document.getElementById('next-month').addEventListener('click', () => { currentDate.setMonth(currentDate.getMonth() + 1); renderCalendar(); });
-        yachtSelector.addEventListener('change', renderCalendar);
-        fetchData();
-    });
-</script>
-</body>
-</html>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Yacht Availability Calendar</title><style>:root{--primary-color:#3498db;--secondary-color:#2c3e50;--light-gray:#ecf0f1;--white:#fff;--booked:#e74c3c;--hold:#f39c12;--available:#2ecc71;--unavailable:#95a5a6}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;margin:0;background-color:#f8f9fa;color:var(--secondary-color)}.container{max-width:1200px;margin:2rem auto;padding:0 1rem}h1{color:var(--secondary-color);text-align:center;margin-bottom:1rem}.controls{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;margin-bottom:2rem;padding:1rem;background:var(--white);border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.05)}#month-year{font-size:1.5rem;font-weight:600;margin:.5rem 1rem}.controls button{background-color:var(--primary-color);color:var(--white);border:none;padding:10px 18px;border-radius:5px;cursor:pointer;font-size:1rem}#yacht-selector{padding:10px;border-radius:5px;border:1px solid #ccc;font-size:1rem;max-width:250px}.calendar{display:grid;grid-template-columns:repeat(7,1fr);gap:5px}.day,.header{background:var(--white);padding:10px;border-radius:4px;min-height:120px;display:flex;flex-direction:column}.header{min-height:auto;text-align:center;font-weight:700;background-color:var(--secondary-color);color:var(--white)}.day .date-num{font-weight:700;margin-bottom:5px}.day.other-month{background-color:var(--light-gray)}.event-container{overflow-y:auto;flex-grow:1}.event{font-size:.8rem;padding:3px 5px;border-radius:3px;margin-bottom:3px;color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.event.booked{background-color:var(--booked)}.event.hold{background-color:var(--hold)}.event.available{background-color:var(--available)}.event.unavailable{background-color:var(--unavailable)}.event.unknown{background-color:#bdc3c7}#back-link{display:inline-block;margin-bottom:1rem;font-weight:500;color:var(--primary-color)}</style></head><body><div class="container"><a href="/" id="back-link">&larr; Back to Main Cockpit</a><h1>Yacht Availability Calendar</h1><div class="controls"><button id="prev-month">&lt;</button><select id="yacht-selector"><option value="">All Yachts</option></select><h2 id="month-year"></h2><button id="next-month">&gt;</button></div><div class="calendar" id="calendar-grid"></div></div><script>document.addEventListener("DOMContentLoaded",async()=>{const e=document.getElementById("calendar-grid"),t=document.getElementById("month-year"),o=document.getElementById("yacht-selector");let a=new Date,n=[];const d=async()=>{try{const t=await fetch("/availability-data");if(!t.ok)throw new Error("Network response was not ok");n=await t.json(),l(),c()}catch(t){console.error("Failed to fetch availability data:",t),e.innerHTML='<p style="grid-column: 1 / 8; text-align: center;">Could not load data. Please run a mirror process first.</p>'}},l=()=>{const e=[...new Set(n.map(e=>e.yacht_name))].sort();o.innerHTML='<option value="">All Yachts</option>',e.forEach(e=>{const t=document.createElement("option");t.value=e,t.textContent=e,o.appendChild(t)})},c=()=>{e.innerHTML="";const n=a.getMonth(),d=a.getFullYear();t.textContent=`${a.toLocaleString("default",{month:"long"})} ${d}`;const l=new Date(d,n,1),i=new Date(d,n+1,0),r=l.getDay();["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].forEach(t=>{const o=document.createElement("div");o.className="header",o.textContent=t,e.appendChild(o)});for(let t=0;t<r;t++)e.insertAdjacentHTML("beforeend",'<div class="day other-month"></div>');const s=o.value,p=s?allEvents.filter(e=>e.yacht_name===s):allEvents;for(let t=1;t<=i.getDate();t++){const o=document.createElement("div");o.className="day";const a=new Date(d,n,t);o.innerHTML=`<div class="date-num">${t}</div><div class="event-container"></div>`;const l=p.filter(e=>{const t=new Date(e.start_date);t.setUTCHours(0,0,0,0);const o=new Date(e.end_date);return o.setUTCHours(0,0,0,0),a>=t&&a<=o}),c=o.querySelector(".event-container");l.forEach(e=>{const t=document.createElement("div");t.className=`event ${e.status}`,t.textContent=e.yacht_name,t.title=`${e.yacht_name} - ${e.status.toUpperCase()}\\n${e.start_date} to ${e.end_date}`,c.appendChild(t)}),e.appendChild(o)}};document.getElementById("prev-month").addEventListener("click",()=>{a.setMonth(a.getMonth()-1),c()}),document.getElementById("next-month").addEventListener("click",()=>{a.setMonth(a.getMonth()+1),c()}),o.addEventListener("change",c),d()})</script></body></html>
 HTMLCODE
 AVAILHTML
