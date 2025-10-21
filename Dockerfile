@@ -119,7 +119,7 @@ from pathlib import Path
 import httpx
 import logging
 import pandas as pd
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, WebSocket
 from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -127,6 +127,7 @@ from contextlib import asynccontextmanager
 import aiofiles
 from app.cyaeb_availability_parser import parse_html_for_dates
 from urllib.parse import urlparse
+from fastapi.middleware.cors import CORSMiddleware # --- FIX: Import CORSMiddleware
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 log = logging.getLogger(__name__)
@@ -162,14 +163,22 @@ async def lifespan(app: FastAPI):
     log.info("Shutting down Mirror Cockpit..."); set_status("idle")
 
 app = FastAPI(title="Website Mirror Cockpit", lifespan=lifespan)
+
+# --- FIX: Add CORS Middleware to allow all origins for WebSocket connections ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 app.mount("/sites", StaticFiles(directory=OUTPUT_DIR), name="sites")
 
 def get_url_path_key(url_str: str) -> str:
-    """Creates a consistent key from a URL (e.g., 'cyaeb.com/3027/dypr/xrn/8459/')"""
     try:
         p = urlparse(url_str)
-        # Strip leading/trailing slashes for consistency
         path = p.path.strip('/')
         return f"{p.netloc}/{path}/"
     except:
@@ -183,7 +192,6 @@ async def post_process_mirrored_data():
 
     for html_file in html_files:
         try:
-            # Reconstruct URL key from file path to look up in our map
             relative_path = html_file.relative_to(OUTPUT_DIR)
             url_key = str(relative_path).replace("index.html", "")
             
@@ -197,10 +205,8 @@ async def post_process_mirrored_data():
             
             avail_rows = parse_html_for_dates(content, yacht_name, url_key)
             
-            # Add to manifest even if there's no availability data
             yacht_manifest.append({
-                "yacht_name": yacht_name,
-                "file_path": str(relative_path),
+                "yacht_name": yacht_name, "file_path": str(relative_path),
                 "domain": str(relative_path.parts[0])
             })
             if avail_rows:
@@ -208,7 +214,6 @@ async def post_process_mirrored_data():
         except Exception as e:
             log.warning(f"Could not process file {html_file}: {e}")
 
-    # Save both manifests
     async with aiofiles.open(YACHTS_MANIFEST_PATH, 'w') as f:
         await f.write(json.dumps(sorted(yacht_manifest, key=lambda x: x['yacht_name']), indent=2))
     async with aiofiles.open(AVAILABILITY_DATA_PATH, 'w') as f:
@@ -222,15 +227,10 @@ async def run_mirror_process():
         if not URLS_CSV_PATH.exists(): raise FileNotFoundError("urls.csv not found.")
         df = pd.read_csv(URLS_CSV_PATH)
         
-        # --- Create the URL -> Name map from the CSV ---
         df_valid = df[df['status_code'] == 200].copy()
         df_valid['url_key'] = df_valid['final_url'].apply(get_url_path_key)
-        
-        # Clean up the title to get just the yacht name
         df_valid['yacht_name'] = df_valid['title'].str.replace(' Yacht Charters', '', regex=False).str.strip()
-        
         url_to_name_map = pd.Series(df_valid.yacht_name.values, index=df_valid.url_key).to_dict()
-
         urls_to_mirror = df_valid['final_url'].dropna().unique().tolist()
         
         if not urls_to_mirror:
@@ -336,7 +336,7 @@ async def get_vpn_status():
         log.warning(f"VPN check failed: {e}"); return {"status": "Disconnected", "ip": "Error", "location": str(e)}
 
 @app.websocket("/ws/status")
-async def websocket_endpoint(websocket):
+async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept(); log.info("WebSocket client connected."); last_pos = 0
     try:
         while True:
