@@ -45,6 +45,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, RedirectResponse,
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from contextlib import asynccontextmanager
+import aiofiles
 
 # --- Configuration ---
 DATA_DIR = Path("/data")
@@ -56,7 +57,9 @@ LOG_FILE_PATH = LOG_DIR / "mirror.log"
 STATUS_FILE_PATH = DATA_DIR / "status.json"
 TEMPLATES_DIR = Path("/app/templates")
 
-# --- Global State ---
+# --- Global State & Concurrency Lock ---
+mirror_lock = asyncio.Lock()
+
 def get_status():
     if not STATUS_FILE_PATH.exists():
         return {"status": "idle", "pid": None}
@@ -89,7 +92,10 @@ async def run_mirror_process():
         set_status("error", "urls.csv not found")
         return
 
-    LOG_FILE_PATH.write_text("")
+    # --- FIX: Clear previous log before starting ---
+    if LOG_FILE_PATH.exists():
+        LOG_FILE_PATH.unlink()
+
     command = [
         "wget", "--mirror", "--page-requisites", "--adjust-extension", "--convert-links", 
         "--span-hosts", "--no-parent", "--directory-prefix", str(OUTPUT_DIR),
@@ -97,10 +103,21 @@ async def run_mirror_process():
         "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36",
         "--append-output", str(LOG_FILE_PATH)
     ]
-    process = await asyncio.create_subprocess_exec(*command)
-    set_status("mirroring", process.pid)
-    await process.wait()
-    set_status("finished" if process.returncode == 0 else f"error: wget exited with code {process.returncode}")
+    
+    process = None
+    # --- FIX: Added try/except/finally for robust error handling ---
+    try:
+        process = await asyncio.create_subprocess_exec(*command)
+        set_status("mirroring", process.pid)
+        await process.wait()
+        set_status("finished" if process.returncode == 0 else f"error: wget exited with code {process.returncode}")
+    except Exception as e:
+        print(f"Error running mirror process: {e}")
+        set_status("error", str(e))
+    finally:
+        if process and process.returncode is None:
+            process.terminate()
+            await process.wait()
 
 # --- HTML Template with a beautiful UI ---
 INDEX_HTML = """
@@ -265,7 +282,6 @@ INDEX_HTML = """
 </script>
 </body></html>
 """
-# --- FIX: This line is simplified to just write the file, solving the error ---
 (TEMPLATES_DIR / "index.html").write_text(INDEX_HTML, encoding="utf-8")
 
 # --- API Endpoints ---
@@ -274,7 +290,8 @@ async def index(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/status", response_class=JSONResponse)
-async def get_status_endpoint(): return get_status()
+async def get_status_endpoint():
+    return get_status()
 
 @app.get("/csv-status", response_class=JSONResponse)
 async def get_csv_status():
@@ -297,9 +314,11 @@ async def get_vpn_status():
 
 @app.post("/start")
 async def start_mirroring():
-    if get_status()['status'] == 'mirroring':
-        raise HTTPException(409, "Mirroring process is already running.")
-    asyncio.create_task(run_mirror_process())
+    # --- FIX: Use a lock to prevent race conditions ---
+    async with mirror_lock:
+        if get_status()['status'] == 'mirroring':
+            raise HTTPException(409, "Mirroring process is already running.")
+        asyncio.create_task(run_mirror_process())
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/stop")
@@ -310,15 +329,17 @@ async def stop_mirroring():
     try:
         os.kill(status['pid'], 15) # SIGTERM
         set_status("idle")
-    except ProcessLookupError: set_status("idle")
+    except ProcessLookupError:
+        set_status("idle")
     return RedirectResponse(url="/", status_code=303)
 
 @app.post("/upload")
 async def upload_csv(file: UploadFile = File(...)):
     if not file.filename.endswith('.csv'):
         raise HTTPException(400, "Invalid file type.")
-    with open(URLS_CSV_PATH, "wb") as buffer:
-        buffer.write(await file.read())
+    # --- FIX: Use aiofiles for non-blocking file writes ---
+    async with aiofiles.open(URLS_CSV_PATH, "wb") as buffer:
+        await buffer.write(await file.read())
     return RedirectResponse(url="/", status_code=303)
 
 @app.get("/sites-list", response_class=JSONResponse)
@@ -334,11 +355,15 @@ async def get_sites_list():
 
 @app.get("/download/{site_name}")
 def download_zip(site_name: str):
-    site_path = OUTPUT_DIR / site_name
-    if not site_path.is_dir(): raise HTTPException(404, "Site not found")
+    site_path = (OUTPUT_DIR / site_name).resolve()
+    # --- FIX: Security check to prevent path traversal ---
+    if not site_path.is_dir() or OUTPUT_DIR.resolve() not in site_path.parents:
+        raise HTTPException(404, "Site not found or access denied")
+    
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file in site_path.rglob("*"): zf.write(file, file.relative_to(site_path))
+        for file in site_path.rglob("*"):
+            zf.write(file, file.relative_to(site_path))
     zip_buffer.seek(0)
     return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": f"attachment; filename={site_name}.zip"})
 
@@ -350,12 +375,14 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             await websocket.send_json({"type": "status", "payload": get_status()})
             if LOG_FILE_PATH.exists():
-                with open(LOG_FILE_PATH, 'r') as f:
-                    f.seek(last_pos)
-                    if new_lines := f.read():
+                # --- FIX: Use aiofiles for non-blocking file reads ---
+                async with aiofiles.open(LOG_FILE_PATH, 'r') as f:
+                    await f.seek(last_pos)
+                    if new_lines := await f.read():
                         await websocket.send_json({"type": "log", "payload": new_lines})
-                        last_pos = f.tell()
+                        last_pos = await f.tell()
             await asyncio.sleep(2)
-    except Exception: print("WebSocket client disconnected.")
+    except Exception:
+        print("WebSocket client disconnected.")
 PYCODE
 PY
